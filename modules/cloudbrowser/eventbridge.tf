@@ -23,6 +23,4 @@ resource "aws_scheduler_schedule" "cloudbrowser" {
       maximum_retry_attempts = 2
     }
   }
-
-  tags = merge(var.tags, { Name = "${var.name}-cloudbrowser" })
 }
