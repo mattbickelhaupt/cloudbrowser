@@ -95,12 +95,18 @@ resource "aws_iam_role_policy" "lambda_cloudbrowser" {
         ]
         Resource = "*"
       },
-      # Bedrock — invoke the chosen model
+      # Bedrock — invoke the chosen model.
+      # Both ARN forms are needed: foundation-model (no account ID) for base model
+      # IDs, and inference-profile (with account ID) for cross-region profile IDs
+      # like us.anthropic.* that route through an inference profile.
       {
-        Sid      = "BedrockInvoke"
-        Effect   = "Allow"
-        Action   = ["bedrock:InvokeModel"]
-        Resource = "arn:aws:bedrock:${var.aws_region}::foundation-model/${var.bedrock_model_id}"
+        Sid    = "BedrockInvoke"
+        Effect = "Allow"
+        Action = ["bedrock:InvokeModel"]
+        Resource = [
+          "arn:aws:bedrock:${var.aws_region}::foundation-model/${var.bedrock_model_id}",
+          "arn:aws:bedrock:${var.aws_region}:${local.account_id}:inference-profile/${var.bedrock_model_id}",
+        ]
       },
       # SNS — publish the report
       {
