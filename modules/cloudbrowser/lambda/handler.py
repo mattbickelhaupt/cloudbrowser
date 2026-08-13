@@ -269,7 +269,7 @@ def fetch_lambda_metrics(function_name: str, start_ms: int, end_ms: int) -> dict
         "throttles": sum(d["Sum"] for d in _get_metric(
             "AWS/Lambda", "Throttles", dims, start_ms, end_ms)),
         "duration_avg_ms": (
-            lambda pts: (sum(d["Sum"] for d in pts) / len(pts)) if pts else 0
+            lambda pts: (sum(d["Average"] for d in pts) / len(pts)) if pts else 0
         )(_get_metric("AWS/Lambda", "Duration", dims, start_ms, end_ms, stat="Average")),
     }
 
