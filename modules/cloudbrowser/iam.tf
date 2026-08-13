@@ -106,8 +106,8 @@ resource "aws_iam_role_policy" "lambda_cloudbrowser" {
         Effect = "Allow"
         Action = ["bedrock:InvokeModel"]
         Resource = [
-          "arn:aws:bedrock:${var.aws_region}::foundation-model/${local.base_model_id}",
-          "arn:aws:bedrock:${var.aws_region}:${local.account_id}:inference-profile/${var.bedrock_model_id}",
+          "arn:aws:bedrock:*::foundation-model/${local.base_model_id}",
+          "arn:aws:bedrock:*:${local.account_id}:inference-profile/${var.bedrock_model_id}",
         ]
       },
       # SNS — publish the report
