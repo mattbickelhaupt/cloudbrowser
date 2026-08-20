@@ -6,11 +6,14 @@ publishes the resulting report to SNS.
 """
 from __future__ import annotations
 
+import base64
 import fnmatch
 import json
 import logging
 import os
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
@@ -21,17 +24,20 @@ logger.setLevel(logging.INFO)
 
 # ── Environment ───────────────────────────────────────────────────────────────
 
-BEDROCK_MODEL_ID         = os.environ["BEDROCK_MODEL_ID"]
-SNS_TOPIC_ARN            = os.environ["SNS_TOPIC_ARN"]
-AWS_REGION_TARGET        = os.environ.get("AWS_REGION_TARGET", os.environ.get("AWS_REGION", "us-east-1"))
-MODULE_NAME              = os.environ.get("MODULE_NAME", "cloudbrowser")
-LAMBDA_PATTERNS          = json.loads(os.environ.get("LAMBDA_PATTERNS", "[]"))
-ECS_CLUSTER_PATTERNS     = json.loads(os.environ.get("ECS_CLUSTER_PATTERNS", "[]"))
-STEP_FUNCTION_PATTERNS   = json.loads(os.environ.get("STEP_FUNCTION_PATTERNS", "[]"))
-LOG_GROUP_PATTERNS       = json.loads(os.environ.get("LOG_GROUP_PATTERNS", "[]"))
-LOG_LEVELS               = json.loads(os.environ.get("LOG_LEVELS", '["ERROR","WARN"]'))
-LOOKBACK_HOURS           = int(os.environ.get("LOOKBACK_HOURS", "24"))
-MAX_LOG_EVENTS_PER_GROUP = int(os.environ.get("MAX_LOG_EVENTS_PER_GROUP", "500"))
+BEDROCK_MODEL_ID             = os.environ["BEDROCK_MODEL_ID"]
+SNS_TOPIC_ARN                = os.environ["SNS_TOPIC_ARN"]
+AWS_REGION_TARGET            = os.environ.get("AWS_REGION_TARGET", os.environ.get("AWS_REGION", "us-east-1"))
+MODULE_NAME                  = os.environ.get("MODULE_NAME", "cloudbrowser")
+LAMBDA_PATTERNS              = json.loads(os.environ.get("LAMBDA_PATTERNS", "[]"))
+ECS_CLUSTER_PATTERNS         = json.loads(os.environ.get("ECS_CLUSTER_PATTERNS", "[]"))
+STEP_FUNCTION_PATTERNS       = json.loads(os.environ.get("STEP_FUNCTION_PATTERNS", "[]"))
+LOG_GROUP_PATTERNS           = json.loads(os.environ.get("LOG_GROUP_PATTERNS", "[]"))
+LOG_LEVELS                   = json.loads(os.environ.get("LOG_LEVELS", '["ERROR","WARN"]'))
+LOOKBACK_HOURS               = int(os.environ.get("LOOKBACK_HOURS", "24"))
+MAX_LOG_EVENTS_PER_GROUP     = int(os.environ.get("MAX_LOG_EVENTS_PER_GROUP", "500"))
+GITHUB_REPO                  = os.environ.get("GITHUB_REPO", "")
+GITHUB_PAT_SECRET_ARN        = os.environ.get("GITHUB_PAT_SECRET_ARN", "")
+GITHUB_PR_HEALTH_THRESHOLD   = int(os.environ.get("GITHUB_PR_HEALTH_THRESHOLD", "80"))
 
 # ── AWS Clients ───────────────────────────────────────────────────────────────
 
@@ -43,6 +49,8 @@ logs_cl     = session.client("logs")
 cw_cl       = session.client("cloudwatch")
 bedrock_cl  = session.client("bedrock-runtime")
 sns_cl      = session.client("sns")
+# Secrets Manager client is only used when GitHub integration is configured.
+sm_cl       = boto3.client("secretsmanager") if GITHUB_PAT_SECRET_ARN else None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -398,7 +406,7 @@ def invoke_bedrock(prompt: str) -> dict:
 # Report Publishing
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def publish_report(report: dict, run_meta: dict) -> None:
+def publish_report(report: dict, run_meta: dict, github_pr_url: str | None = None) -> None:
     human   = report.get("human_report", "No human report generated.")
     machine = report.get("machine_report", {})
 
@@ -407,6 +415,17 @@ def publish_report(report: dict, run_meta: dict) -> None:
         f"[CloudBrowser] {MODULE_NAME} | "
         f"Health {health}/100 | "
         f"{run_meta['start'][:10]}"
+    )
+
+    pr_section = (
+        [
+            "",
+            "GITHUB PULL REQUEST",
+            "-" * 60,
+            f"A PR with suggested fixes has been opened: {github_pr_url}",
+        ]
+        if github_pr_url
+        else []
     )
 
     body = "\n".join([
@@ -418,6 +437,7 @@ def publish_report(report: dict, run_meta: dict) -> None:
         "HUMAN SUMMARY",
         "-" * 60,
         human,
+        *pr_section,
         "",
         "MACHINE-READABLE DATA",
         "-" * 60,
@@ -436,6 +456,199 @@ def publish_report(report: dict, run_meta: dict) -> None:
         },
     )
     logger.info("Report published successfully.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# GitHub Integration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _get_github_pat() -> str:
+    """Fetch the GitHub PAT from Secrets Manager.
+
+    Supports both plain-string secrets and JSON-wrapped secrets like
+    {"token": "ghp_..."} or {"github_pat": "ghp_..."}.
+    """
+    resp   = sm_cl.get_secret_value(SecretId=GITHUB_PAT_SECRET_ARN)
+    secret = resp.get("SecretString") or resp.get("SecretBinary", b"").decode()
+    try:
+        parsed = json.loads(secret)
+        if isinstance(parsed, dict) and parsed:
+            return next(iter(parsed.values()))
+    except (json.JSONDecodeError, StopIteration):
+        pass
+    return secret.strip()
+
+
+def _github_api(method: str, url: str, token: str, data: dict | None = None) -> dict:
+    """Minimal GitHub REST API helper using only stdlib urllib."""
+    body = json.dumps(data).encode() if data is not None else None
+    req  = urllib.request.Request(
+        url,
+        data=body,
+        method=method,
+        headers={
+            "Authorization":        f"Bearer {token}",
+            "Accept":               "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type":         "application/json",
+            "User-Agent":           "cloudbrowser-lambda/1.0",
+        },
+    )
+    with urllib.request.urlopen(req) as resp:
+        return json.loads(resp.read())
+
+
+def open_github_pr(report: dict, run_meta: dict) -> str | None:
+    """Open a GitHub PR with the CloudBrowser report if issues are detected.
+
+    Returns the PR URL on success, or None when GitHub is not configured,
+    no issues were found, or a PR for today already exists.
+    """
+    if not GITHUB_REPO or not GITHUB_PAT_SECRET_ARN:
+        return None
+
+    mr           = report.get("machine_report", {})
+    health       = mr.get("health_score", 100)
+    recs         = mr.get("recommendations", [])
+    has_high_rec = any(r.get("priority") == "HIGH" for r in recs)
+    health_val   = health if isinstance(health, (int, float)) else 100
+
+    if health_val >= GITHUB_PR_HEALTH_THRESHOLD and not has_high_rec:
+        logger.info(
+            "GitHub PR skipped — health %s/100 is above threshold %s and no HIGH recommendations.",
+            health, GITHUB_PR_HEALTH_THRESHOLD,
+        )
+        return None
+
+    logger.info(
+        "Opening GitHub PR for %s (health=%s, high_rec=%s).",
+        GITHUB_REPO, health, has_high_rec,
+    )
+
+    token    = _get_github_pat()
+    api_base = f"https://api.github.com/repos/{GITHUB_REPO}"
+    date_str = run_meta["start"][:10]
+    branch   = f"cloudbrowser/issues-{date_str}"
+
+    # Resolve default branch HEAD
+    repo_info      = _github_api("GET", api_base, token)
+    default_branch = repo_info["default_branch"]
+    ref_info       = _github_api("GET", f"{api_base}/git/ref/heads/{default_branch}", token)
+    base_sha       = ref_info["object"]["sha"]
+
+    # Create the branch (ignore 422 = already exists)
+    try:
+        _github_api("POST", f"{api_base}/git/refs", token, {
+            "ref": f"refs/heads/{branch}",
+            "sha": base_sha,
+        })
+    except urllib.error.HTTPError as exc:
+        if exc.code != 422:
+            raise
+        logger.info("Branch %s already exists, reusing it.", branch)
+
+    # Build the report file content
+    top_errors = mr.get("top_errors", [])
+    err_lines  = [
+        f"| `{e.get('message', '')[:120]}` | {e.get('count', '?')} | `{e.get('log_group', '?')}` |"
+        for e in top_errors
+    ]
+    rec_lines  = [
+        f"- **{r.get('priority', 'N/A')}**: {r.get('description', '')}"
+        for r in recs
+    ]
+
+    content_md = "\n".join([
+        f"# CloudBrowser Report — {date_str}",
+        "",
+        f"| Field | Value |",
+        f"|-------|-------|",
+        f"| Health Score | **{health}/100** |",
+        f"| Observation Window | {run_meta['start']} → {run_meta['end']} |",
+        f"| Log Groups Scanned | {mr.get('log_groups_scanned', '?')} |",
+        f"| Total Events | {mr.get('total_events_analysed', '?')} |",
+        f"| Errors | {mr.get('error_count', '?')} |",
+        f"| Warnings | {mr.get('warn_count', '?')} |",
+        "",
+        "## Summary",
+        "",
+        report.get("human_report", "_No summary generated._"),
+        "",
+        *(
+            ["## Top Errors", "", "| Message | Count | Log Group |", "|---------|-------|-----------|", *err_lines, ""]
+            if err_lines else []
+        ),
+        "## Recommendations",
+        "",
+        *(rec_lines if rec_lines else ["_No recommendations._"]),
+        "",
+        "---",
+        "",
+        "<details><summary>Machine-readable data</summary>",
+        "",
+        "```json",
+        json.dumps(mr, indent=2, default=str),
+        "```",
+        "",
+        "</details>",
+        "",
+        "_Report generated automatically by [CloudBrowser](https://github.com/mattbick/cloudbrowser)._",
+    ])
+
+    file_path = f"cloudbrowser-reports/{date_str}.md"
+    encoded   = base64.b64encode(content_md.encode()).decode()
+
+    # Upsert the file on the branch (fetch existing SHA for updates)
+    file_sha: str | None = None
+    try:
+        existing = _github_api("GET", f"{api_base}/contents/{file_path}?ref={branch}", token)
+        file_sha = existing.get("sha")
+    except urllib.error.HTTPError:
+        pass
+
+    file_payload: dict = {
+        "message": f"chore(cloudbrowser): report {date_str} — health {health}/100",
+        "content": encoded,
+        "branch":  branch,
+    }
+    if file_sha:
+        file_payload["sha"] = file_sha
+    _github_api("PUT", f"{api_base}/contents/{file_path}", token, file_payload)
+
+    # Build PR body
+    pr_body = "\n".join([
+        f"## CloudBrowser automated report — {date_str}",
+        "",
+        f"**Health Score**: {health}/100  ",
+        f"**Observation Window**: {run_meta['start']} → {run_meta['end']}  ",
+        f"**Log Groups Scanned**: {mr.get('log_groups_scanned', '?')}  ",
+        f"**Errors / Warnings**: {mr.get('error_count', '?')} / {mr.get('warn_count', '?')}",
+        "",
+        "### Recommendations",
+        "",
+        *(rec_lines if rec_lines else ["_No recommendations._"]),
+        "",
+        f"Full report: [`{file_path}`]({file_path})",
+        "",
+        "_Opened automatically by CloudBrowser._",
+    ])
+
+    # Create PR; 422 means one already exists for this head branch
+    try:
+        pr = _github_api("POST", f"{api_base}/pulls", token, {
+            "title": f"[CloudBrowser] Issues detected — health {health}/100 ({date_str})",
+            "body":  pr_body,
+            "head":  branch,
+            "base":  default_branch,
+        })
+        pr_url = pr.get("html_url", "")
+        logger.info("GitHub PR opened: %s", pr_url)
+        return pr_url
+    except urllib.error.HTTPError as exc:
+        if exc.code == 422:
+            logger.info("GitHub PR already exists for branch %s.", branch)
+            return None
+        raise
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -496,8 +709,15 @@ def lambda_handler(event: dict, context: Any) -> dict:
     })
     report["machine_report"] = mr
 
-    # 5. Publish report via SNS
-    publish_report(report, run_meta)
+    # 5. Open a GitHub PR if issues are detected
+    github_pr_url: str | None = None
+    try:
+        github_pr_url = open_github_pr(report, run_meta)
+    except Exception as exc:
+        logger.error("GitHub PR creation failed (non-fatal): %s", exc, exc_info=True)
+
+    # 6. Publish report via SNS
+    publish_report(report, run_meta, github_pr_url=github_pr_url)
 
     return {
         "statusCode": 200,
@@ -506,5 +726,6 @@ def lambda_handler(event: dict, context: Any) -> dict:
             "total_events":       total_events,
             "health_score":       mr.get("health_score"),
             "elapsed_seconds":    mr["elapsed_seconds"],
+            "github_pr_url":      github_pr_url,
         },
     }

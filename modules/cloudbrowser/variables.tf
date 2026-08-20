@@ -114,6 +114,31 @@ variable "lambda_memory_mb" {
   default     = 512
 }
 
+# ── GitHub Integration ────────────────────────────────────────────────────────
+
+variable "github_repo" {
+  description = "GitHub repository in 'owner/repo' format (e.g. 'acme/my-app'). When set together with github_pat_secret_arn, CloudBrowser will open a PR against this repo whenever issues are detected."
+  type        = string
+  default     = ""
+}
+
+variable "github_pat_secret_arn" {
+  description = "ARN of the AWS Secrets Manager secret that holds the GitHub Personal Access Token. The secret value may be a plain-text token string or a JSON object with a single key whose value is the token (e.g. {\"token\": \"ghp_...\"}). The token must have 'repo' scope (contents + pull_requests write)."
+  type        = string
+  default     = ""
+}
+
+variable "github_pr_health_threshold" {
+  description = "Minimum health score (0-100) below which a GitHub PR is automatically opened. A PR is also opened whenever a HIGH-priority recommendation exists, regardless of this threshold."
+  type        = number
+  default     = 80
+
+  validation {
+    condition     = var.github_pr_health_threshold >= 0 && var.github_pr_health_threshold <= 100
+    error_message = "github_pr_health_threshold must be between 0 and 100."
+  }
+}
+
 # ── Tags ─────────────────────────────────────────────────────────────────────
 
 variable "tags" {

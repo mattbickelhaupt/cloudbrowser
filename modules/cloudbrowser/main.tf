@@ -53,6 +53,9 @@ resource "aws_lambda_function" "cloudbrowser" {
       LOOKBACK_HOURS               = tostring(var.lookback_hours)
       MAX_LOG_EVENTS_PER_GROUP     = tostring(var.max_log_events_per_group)
       MODULE_NAME                  = var.name
+      GITHUB_REPO                  = var.github_repo
+      GITHUB_PAT_SECRET_ARN        = var.github_pat_secret_arn
+      GITHUB_PR_HEALTH_THRESHOLD   = tostring(var.github_pr_health_threshold)
     }
   }
 

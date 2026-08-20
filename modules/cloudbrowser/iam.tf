@@ -134,6 +134,25 @@ resource "aws_iam_role_policy" "lambda_cloudbrowser" {
   })
 }
 
+# ── GitHub Integration — Secrets Manager access (only when PAT ARN is given) ──
+
+resource "aws_iam_role_policy" "lambda_github_secret" {
+  count = var.github_pat_secret_arn != "" ? 1 : 0
+
+  name = "${var.name}-cloudbrowser-github-secret"
+  role = aws_iam_role.lambda_exec.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "SecretsManagerReadGitHubPAT"
+      Effect   = "Allow"
+      Action   = ["secretsmanager:GetSecretValue"]
+      Resource = var.github_pat_secret_arn
+    }]
+  })
+}
+
 # ── EventBridge Scheduler Role ────────────────────────────────────────────────
 
 resource "aws_iam_role" "scheduler" {
